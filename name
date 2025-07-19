@@ -2,126 +2,129 @@ import RPi.GPIO as GPIO
 import time
 import atexit
 
-# Chân cảm biến line (L - C - R)
-SENSOR_LEFT = 16
-SENSOR_CENTER = 18
-SENSOR_RIGHT = 22
+# === CẤU HÌNH CHÂN GPIO ===
+SENSOR_LEFT = 23
+SENSOR_CENTER = 24
+SENSOR_RIGHT = 25
 
-# Chân điều khiển động cơ
 MOTOR_PINS = {
-    'IN1': 31,   # Trái
-    'IN2': 29,
-    'ENA': 12,
-    'IN3': 15,  # Phải
-    'IN4': 33,
-    'ENB': 32   
+    'IN1': 6, 'IN2': 5, 'ENA': 12,    # Motor trái
+    'IN3': 22, 'IN4': 27, 'ENB': 13   # Motor phải
 }
 
-# Thiết lập GPIO
+# === PID HẰNG SỐ VÀ TỐC ĐỘ ===
+PID_CONSTANTS = {'KP': 70.0, 'KI': 0.0, 'KD': 25.0}
+SPEED_CONFIG = {'BASE_SPEED': 30, 'MAX_SPEED': 80, 'MIN_SPEED': 15, 'PWM_FREQUENCY': 1000}
+
+# === KHỞI TẠO GPIO ===
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
-
 GPIO.setup([SENSOR_LEFT, SENSOR_CENTER, SENSOR_RIGHT], GPIO.IN)
 GPIO.setup(list(MOTOR_PINS.values()), GPIO.OUT)
 
-# PWM động cơ
-pwm_ena = GPIO.PWM(MOTOR_PINS['ENA'], 500)
-pwm_enb = GPIO.PWM(MOTOR_PINS['ENB'], 500)
+pwm_ena = GPIO.PWM(MOTOR_PINS['ENA'], SPEED_CONFIG['PWM_FREQUENCY'])
+pwm_enb = GPIO.PWM(MOTOR_PINS['ENB'], SPEED_CONFIG['PWM_FREQUENCY'])
 pwm_ena.start(0)
 pwm_enb.start(0)
 
-# === Điều khiển động cơ ===
-def set_motor(l_in1, l_in2, r_in3, r_in4, speed_l, speed_r):
-    GPIO.output(MOTOR_PINS['IN1'], l_in1)
-    GPIO.output(MOTOR_PINS['IN2'], l_in2)
-    GPIO.output(MOTOR_PINS['IN3'], r_in3)
-    GPIO.output(MOTOR_PINS['IN4'], r_in4)
-    pwm_ena.ChangeDutyCycle(speed_l)
-    pwm_enb.ChangeDutyCycle(speed_r)
+# === HÀM DỌN DẸP ===
+def cleanup():
+    pwm_ena.stop()
+    pwm_enb.stop()
+    GPIO.cleanup()
+
+atexit.register(cleanup)
+
+# === HÀM ĐIỀU KHIỂN ĐỘNG CƠ ===
+def set_motor(left_forward, left_backward, right_forward, right_backward, left_speed, right_speed):
+    GPIO.output(MOTOR_PINS['IN1'], left_forward)
+    GPIO.output(MOTOR_PINS['IN2'], left_backward)
+    GPIO.output(MOTOR_PINS['IN3'], right_forward)
+    GPIO.output(MOTOR_PINS['IN4'], right_backward)
+    pwm_ena.ChangeDutyCycle(max(0, min(100, left_speed)))
+    pwm_enb.ChangeDutyCycle(max(0, min(100, right_speed)))
+
+def forward(left_speed, right_speed):
+    set_motor(0, 1, 1, 0, left_speed, right_speed)
 
 def stop():
     set_motor(0, 0, 0, 0, 0, 0)
 
-def forward(speed=25):
-    set_motor(0, 1, 1, 0, speed, speed)
-
-def left(speed=20):
-    set_motor(1, 0, 1, 0, speed, speed)
-
-def right(speed=20):
-    set_motor(0, 1, 0, 1, speed, speed)
-
-# === PID điều khiển ===
+# === LỚP PID ===
 class PID:
-    def __init__(self, kp=1.0, ki=0.05, kd=0.3):
+    def __init__(self, kp, ki, kd):
         self.kp = kp
         self.ki = ki
         self.kd = kd
-        self.integral = 0
         self.prev_error = 0
-        self.prev_time = time.time()
+        self.integral = 0
+        self.last_time = time.time()
 
     def compute(self, error):
-        now = time.time()
-        dt = now - self.prev_time if now > self.prev_time else 0.01
-        self.prev_time = now
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
 
         self.integral += error * dt
-        derivative = (error - self.prev_error) / dt
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0
 
         output = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.prev_error = error
         return output
 
-# === Đọc cảm biến ===
+# === ĐỌC CẢM BIẾN ===
 def read_sensors():
     L = GPIO.input(SENSOR_LEFT)
     C = GPIO.input(SENSOR_CENTER)
     R = GPIO.input(SENSOR_RIGHT)
-    return (L, C, R)
+    return L, C, R
 
-# === Dò line chính ===
-def line_following():
-    sensors = read_sensors()
-    L, C, R = sensors
-    print(f"Cảm biến: L={L}, C={C}, R={R}")
-
-    # Quy đổi trạng thái cảm biến sang sai số
-    if C == 1 and L == 0 and R == 0:
-        error = 0  # đi thẳng
-    elif L == 1 and C == 0:
-        error = 1  # lệch trái
-    elif R == 1 and C == 0:
-        error = -1  # lệch phải
-    elif L == 1 and R == 1:
-        error = 0  # có thể là ngã tư – coi như đi thẳng
+# === TÍNH LỖI PID ===
+def calculate_error(L, C, R):
+    if L == 1 and C == 0 and R == 0:
+        return 2
+    elif L == 1 and C == 1 and R == 0:
+        return 1
+    elif L == 0 and C == 1 and R == 0:
+        return 0
+    elif L == 0 and C == 1 and R == 1:
+        return -1
+    elif L == 0 and C == 0 and R == 1:
+        return -2
+    elif L == 0 and C == 0 and R == 0:
+        return 0  # mất line: tiến thẳng tạm thời
     else:
-        error = 0  # mặc định
+        return 0
 
-    # Điều khiển PID
-    correction = pid.compute(error)
-    base_speed = 25
+# === LỚP CHÍNH ĐIỀU KHIỂN DÒ LINE ===
+class LineFollowingRobot:
+    def __init__(self):
+        self.pid = PID(PID_CONSTANTS['KP'], PID_CONSTANTS['KI'], PID_CONSTANTS['KD'])
+        self.base_speed = SPEED_CONFIG['BASE_SPEED']
+        self.motor_trim = {'LEFT': 5.0, 'RIGHT': -5.0}  # Điều chỉnh nếu motor lệch
 
-    left_speed = max(0, min(base_speed - correction, 100))
-    right_speed = max(0, min(base_speed + correction, 100))
-    set_motor(0, 1, 1, 0, left_speed, right_speed)
+    def run(self):
+        print("Khởi động robot dò line PID...")
+        try:
+            while True:
+                L, C, R = read_sensors()
+                error = calculate_error(L, C, R)
+                correction = self.pid.compute(error)
 
-# === Dọn dẹp khi kết thúc ===
-def cleanup():
-    stop()
-    pwm_ena.stop()
-    pwm_enb.stop()
-    GPIO.cleanup()
-    print("Đã thoát và dọn dẹp GPIO")
+                left_speed = self.base_speed - correction + self.motor_trim['LEFT']
+                right_speed = self.base_speed + correction + self.motor_trim['RIGHT']
 
-atexit.register(cleanup)
+                # Giới hạn tốc độ
+                left_speed = max(SPEED_CONFIG['MIN_SPEED'], min(SPEED_CONFIG['MAX_SPEED'], left_speed))
+                right_speed = max(SPEED_CONFIG['MIN_SPEED'], min(SPEED_CONFIG['MAX_SPEED'], right_speed))
 
-# === Chạy chương trình ===
-pid = PID(kp=1.2, ki=0.05, kd=0.2)
-print("Khởi động dò line...")
-try:
-    while True:
-        line_following()
-        time.sleep(0.01)
-except KeyboardInterrupt:
-    cleanup()
+                forward(left_speed, right_speed)
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            print("Dừng robot.")
+            stop()
+
+# === CHẠY ===
+if __name__ == "__main__":
+    robot = LineFollowingRobot()
+    robot.run()
